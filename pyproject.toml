@@ -15,7 +15,7 @@ license = "Apache-2.0"
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = ">= 3.10 < 4.0"
+python = ">= 3.10"
 tqdm = ">= 4.66.0"
 torch = ">= 2.5.0"
 torchvision = ">= 0.18.1"
@@ -44,7 +44,6 @@ bs4 = ">= 0.0.2"
 ftfy = ">= 6.2.0"
 cd-fvd = ">= 0.1.1"
 xformers = ">= 0.0.26"
-pyav = ">= 13.0.0"
 clip = ">= 0.2.0"
 image_reward = { git = "https://github.com/THUDM/ImageReward.git", branch = "main" }
 
