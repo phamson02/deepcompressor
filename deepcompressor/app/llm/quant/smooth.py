@@ -80,12 +80,16 @@ def smooth_llm_layer(  # noqa: C901
     if config.smooth.enabled_proj and config.smooth.proj.is_enabled_for(attn.qkv_proj_key) and needs_quant:
         logger.debug("- %s.%s", attn.name, attn.qkv_proj_rkey)
         cache_key = attn.v_proj_name
+        # Respect extra_wgts override for qkv_proj
+        weight_qcfg = config.wgts
+        if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(attn.qkv_proj_key):
+            weight_qcfg = config.extra_wgts
         smooth_cache[cache_key] = smooth_linear_modules(
             attn.parent.pre_attn_norm,
             attn.qkv_proj,
             scale=smooth_cache.get(cache_key, None),
             config=config.smooth.proj,
-            weight_quantizer=Quantizer(config.wgts, key=attn.qkv_proj_key),
+            weight_quantizer=Quantizer(weight_qcfg, key=attn.qkv_proj_key),
             input_quantizer=Quantizer(config.ipts, channels_dim=-1, key=attn.qkv_proj_key),
             inputs=layer_cache[attn.q_proj_name].inputs if layer_cache else None,
             eval_inputs=layer_cache[attn.name].inputs if layer_cache else None,
@@ -102,12 +106,16 @@ def smooth_llm_layer(  # noqa: C901
     if config.smooth.enabled_proj and config.smooth.proj.is_enabled_for(attn.out_proj_key) and needs_quant:
         logger.debug("- %s.%s", attn.name, attn.out_proj_rkey)
         cache_key = attn.o_proj_name
+        # Respect extra_wgts override for out_proj
+        weight_qcfg = config.wgts
+        if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(attn.out_proj_key):
+            weight_qcfg = config.extra_wgts
         smooth_cache[cache_key] = smooth_linear_modules(
             None if attn.config.linear_attn else attn.v_proj,
             attn.o_proj,
             scale=smooth_cache.get(cache_key, None),
             config=config.smooth.proj,
-            weight_quantizer=Quantizer(config.wgts, key=attn.out_proj_key),
+            weight_quantizer=Quantizer(weight_qcfg, key=attn.out_proj_key),
             input_quantizer=Quantizer(config.ipts, channels_dim=-1, key=attn.out_proj_key),
             inputs=layer_cache[cache_key].inputs if layer_cache else None,
             eval_inputs=layer_cache[cache_key].inputs if layer_cache else None,
@@ -126,12 +134,16 @@ def smooth_llm_layer(  # noqa: C901
     if config.smooth.enabled_proj and config.smooth.proj.is_enabled_for(ffn.up_proj_key) and needs_quant:
         logger.debug("- %s.%s", ffn.name, ffn.up_proj_rkey)
         cache_key = ffn.name
+        # Respect extra_wgts override for up_proj
+        weight_qcfg = config.wgts
+        if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(ffn.up_proj_key):
+            weight_qcfg = config.extra_wgts
         smooth_cache[cache_key] = smooth_linear_modules(
             ffn.parent.pre_ffn_norm,
             ffn.up_projs,
             scale=smooth_cache.get(cache_key, None),
             config=config.smooth.proj,
-            weight_quantizer=Quantizer(config.wgts, key=ffn.up_proj_key),
+            weight_quantizer=Quantizer(weight_qcfg, key=ffn.up_proj_key),
             input_quantizer=Quantizer(config.ipts, channels_dim=-1, key=ffn.up_proj_key),
             inputs=layer_cache[ffn.name].inputs if layer_cache else None,
             eval_inputs=layer_cache[ffn.name].inputs if layer_cache else None,
@@ -151,12 +163,16 @@ def smooth_llm_layer(  # noqa: C901
         for expert_idx in range(num_experts):
             logger.debug("- %s.%s", ffn.expert_names[expert_idx], ffn.down_proj_rkey)
             cache_key = ffn.down_proj_names[expert_idx]
+            # Respect extra_wgts override for down_proj
+            weight_qcfg = config.wgts
+            if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(ffn.down_proj_key):
+                weight_qcfg = config.extra_wgts
             smooth_cache[cache_key] = smooth_linear_modules(
                 ffn.up_projs[expert_idx],
                 ffn.down_projs[expert_idx],
                 scale=smooth_cache.get(cache_key, None),
                 config=config.smooth.proj,
-                weight_quantizer=Quantizer(config.wgts, key=ffn.down_proj_key),
+                weight_quantizer=Quantizer(weight_qcfg, key=ffn.down_proj_key),
                 input_quantizer=Quantizer(config.ipts, channels_dim=-1, key=ffn.down_proj_key),
                 inputs=layer_cache[ffn.down_proj_names[expert_idx]].inputs if layer_cache else None,
                 eval_inputs=layer_cache[ffn.down_proj_names[expert_idx]].inputs if layer_cache else None,

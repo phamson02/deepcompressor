@@ -57,6 +57,8 @@ class LlmQuantConfig(LlmModuleQuantizerConfig):
     develop_dtype: torch.dtype = field(default_factory=lambda s=torch.float32: eval_dtype(s, with_quant_dtype=False))
 
     def __post_init__(self) -> None:  # noqa: C901
+        # Ensure base module-quantizer post-init runs (handles extra_wgts harmonization)
+        super().__post_init__()
         if self.smooth is not None:
             if not self.smooth.enabled_proj and not self.smooth.enabled_attn:
                 self.smooth = None
@@ -115,6 +117,11 @@ class LlmQuantConfig(LlmModuleQuantizerConfig):
     def enabled_rotation(self) -> bool:
         """Whether to enable rotation."""
         return self.rotation is not None
+
+    @property
+    def enabled_extra_wgts(self) -> bool:
+        """Whether to enable extra weights."""
+        return self.extra_wgts is not None and self.extra_wgts.is_enabled()
 
     @property
     def needs_acts_quantizer_cache(self) -> bool:

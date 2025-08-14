@@ -11,7 +11,7 @@ from deepcompressor.calib.config import SkipBasedDynamicRangeCalibConfig
 from deepcompressor.data.dtype import QuantDataType
 from deepcompressor.quantizer.config import ProgressiveQuantizerConfig
 from deepcompressor.quantizer.kernel import QuantGptqConfig
-from deepcompressor.utils.config import EnableConfig, SkipBasedConfig
+from deepcompressor.utils.config import EnableConfig, IncludeBasedConfig, SkipBasedConfig
 
 __all__ = ["LlmQuantizerConfig", "LlmWeightQuantizerConfig", "LlmActivationQuantizerConfig", "LlmModuleQuantizerConfig"]
 
@@ -150,6 +150,19 @@ class LlmActivationQuantizerConfig(LlmQuantizerConfig):
 
 @configclass
 @dataclass
+class LlmExtraWeightQuantizerConfig(IncludeBasedConfig, LlmQuantizerConfig):
+    """LLM Extra Weight Quantizer Configuration for per-key overrides.
+
+    This allows specifying a different weight dtype for a subset of module keys
+    via the `includes` list, while inheriting other settings from the base
+    weight config.
+    """
+
+    static: bool = field(init=False, default=True)
+
+
+@configclass
+@dataclass(kw_only=True)
 class LlmModuleQuantizerConfig(EnableConfig):
     """Llm Module quantization configuration.
 
@@ -165,6 +178,21 @@ class LlmModuleQuantizerConfig(EnableConfig):
     wgts: LlmWeightQuantizerConfig
     ipts: LlmActivationQuantizerConfig
     opts: LlmActivationQuantizerConfig
+    extra_wgts: LlmExtraWeightQuantizerConfig | None = None
+
+    def __post_init__(self) -> None:
+        # Harmonize extra_wgts with base wgts: remove overlaps and inherit calib/kernel settings
+        if self.wgts is not None and self.wgts.is_enabled() and self.extra_wgts is not None:
+            # Exclude any includes that are also skipped by base wgts
+            self.extra_wgts.includes = [key for key in self.extra_wgts.includes if key not in (self.wgts.skips or [])]
+            if self.extra_wgts.is_enabled():
+                # Inherit kernel/calib settings so override behaves like base where not explicitly changed
+                self.extra_wgts.kernel_gptq = self.wgts.kernel_gptq
+                self.extra_wgts.calib_range = self.wgts.calib_range
+            else:
+                self.extra_wgts = None
+        else:
+            self.extra_wgts = None
 
     def is_enabled(self) -> bool:
         """Whether the quantization is enabled."""
@@ -184,6 +212,11 @@ class LlmModuleQuantizerConfig(EnableConfig):
     def enabled_opts(self) -> bool:
         """Whether to enable activation quantization."""
         return self.opts is not None and self.opts.is_enabled()
+
+    @property
+    def enabled_extra_wgts(self) -> bool:
+        """Whether to enable extra weight quantization overrides."""
+        return self.extra_wgts is not None and self.extra_wgts.is_enabled()
 
     def generate_dirnames(
         self,
@@ -218,6 +251,12 @@ class LlmModuleQuantizerConfig(EnableConfig):
             f"{wgts_name}-{ipts_name}-{opts_name}"
             for wgts_name, ipts_name, opts_name in zip(wgts_names, ipts_names, opts_names, strict=True)
         ]
+        if self.extra_wgts is not None:
+            extra_wgts_names = self.extra_wgts.generate_dirnames(prefix="w", shape=shape, default_dtype=default_dtype)
+            # Append only the include suffix to the last component to keep vector lengths aligned
+            if extra_wgts_names:
+                include_suffix = extra_wgts_names[-1]
+                names[-1] = f"{names[-1]}-{include_suffix}"
         if prefix:
             names = [f"{prefix}.[{name}]" for name in names]
         return names

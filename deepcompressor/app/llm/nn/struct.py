@@ -673,9 +673,16 @@ class LlmTransformerStruct(BaseTransformerStruct):
         self.layers_name = join_name(self.name, self.layers_rname)
         layer_rnames = [f"{self.layers_rname}.{idx}" for idx in range(len(self.layers))]
         self.layer_names = [join_name(self.name, rname) for rname in layer_rnames]
+        # Assign a unique per-layer key if none is provided so that quantization configs
+        # can target specific layers using skip/include keys.
         self.layer_structs = [
             self.layer_struct_cls.construct(
-                layer, parent=self, fname="layer", rname=rname, rkey=self.layer_rkey, idx=idx
+                layer,
+                parent=self,
+                fname="layer",
+                rname=rname,
+                rkey=self.layer_rkey or f"{self.layers_rname}_{idx}",
+                idx=idx,
             )
             for idx, (layer, rname) in enumerate(zip(self.layers, layer_rnames, strict=True))
         ]

@@ -62,7 +62,11 @@ def quantize_llm_layer_weights(  # noqa: C901
             eval_name, eval_module, eval_kwargs = parent.name, parent.module, parent.filter_kwargs(layer_kwargs)
         else:
             eval_name, eval_module, eval_kwargs = module_name, module, None
-        quantizer = LlmWeightQuantizer(config.wgts, develop_dtype=config.develop_dtype, key=module_key)
+        # Use extra_wgts override when includes match this key; otherwise base config
+        qcfg = config.wgts
+        if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(module_key):
+            qcfg = config.extra_wgts
+        quantizer = LlmWeightQuantizer(qcfg, develop_dtype=config.develop_dtype, key=module_key)
         if quantizer.is_enabled():
             if module_name not in quantizer_state_dict:
                 logger.debug("- Calibrating %s.weight", module_name)
@@ -79,7 +83,10 @@ def quantize_llm_layer_weights(  # noqa: C901
     scale_state_dict: dict[str, torch.Tensor | float | None] = {}
     for module_key, module_name, module, _, _ in layer.named_key_modules():
         assert isinstance(module, nn.Linear)
-        quantizer = LlmWeightQuantizer(config.wgts, develop_dtype=config.develop_dtype, key=module_key)
+        qcfg = config.wgts
+        if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(module_key):
+            qcfg = config.extra_wgts
+        quantizer = LlmWeightQuantizer(qcfg, develop_dtype=config.develop_dtype, key=module_key)
         param_name = f"{module_name}.weight"
         if quantizer.is_enabled():
             logger.debug("- Quantizing %s", param_name)
