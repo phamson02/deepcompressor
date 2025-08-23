@@ -66,6 +66,22 @@ class LlmPtqRunConfig:
     load_from: str = ""
     save_model: str = ""
     copy_on_save: bool = False
+    # Single-layer ΔLoss scan settings
+    delta_single_layer: bool = False
+    delta_fields: list[str] = field(
+        default_factory=lambda: [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "up_proj",
+            "down_proj",
+            "moe_gate",
+        ],
+        metadata={omniconfig.ARGPARSE_KWARGS: {"nargs": "*", "type": str}},
+    )
+    # Metric to compare in delta mode: "ppl" or "nll"
+    delta_metric: str = field(default="ppl")
 
     def __post_init__(self):  # noqa: C901
         # region set scale default dtype

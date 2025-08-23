@@ -55,18 +55,45 @@ def quantize_llm_layer_weights(  # noqa: C901
     tools.logging.Formatter.indent_inc()
     layer_cache = layer_cache or {}
     layer_kwargs = layer_kwargs or {}
+    # Normalize requested-only field names for filtering (if provided)
+    only_fields = set(config.only_fields) if getattr(config, "only_fields", ()) else None
+    only_module_names = set(config.only_module_names) if getattr(config, "only_module_names", ()) else None
+    def _field_allowed(name: str) -> bool:
+        if only_fields is None or len(only_fields) == 0:
+            return True
+        # accept simple aliases: up -> up_proj, down -> down_proj, o -> o_proj, q/k/v -> q_proj/k_proj/v_proj
+        alias = {
+            "up": "up_proj",
+            "down": "down_proj",
+            "o": "o_proj",
+            "q": "q_proj",
+            "k": "k_proj",
+            "v": "v_proj",
+            "gate": "moe_gate",
+        }.get(name, name)
+        return alias in only_fields
+
     for module_key, module_name, module, parent, field_name in layer.named_key_modules():
+        if only_module_names and module_name not in only_module_names:
+            continue
+        if not _field_allowed(field_name):
+            continue
         assert isinstance(module, nn.Linear)
         if field_name in ("q_proj", "k_proj"):
             assert isinstance(parent, LlmSelfAttentionStruct)
             eval_name, eval_module, eval_kwargs = parent.name, parent.module, parent.filter_kwargs(layer_kwargs)
         else:
             eval_name, eval_module, eval_kwargs = module_name, module, None
-        # Use extra_wgts override when includes match this key; otherwise base config
+        # Compute effective key for q/k/v to enable per-projection control
+        eff_key = module_key
+        if field_name in ("q_proj", "k_proj", "v_proj"):
+            assert isinstance(parent, LlmSelfAttentionStruct)
+            eff_key = {"q_proj": parent.q_key, "k_proj": parent.k_key, "v_proj": parent.v_key}[field_name]
+        # Use extra_wgts override when includes match the effective key; otherwise base config
         qcfg = config.wgts
-        if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(module_key):
+        if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(eff_key):
             qcfg = config.extra_wgts
-        quantizer = LlmWeightQuantizer(qcfg, develop_dtype=config.develop_dtype, key=module_key)
+        quantizer = LlmWeightQuantizer(qcfg, develop_dtype=config.develop_dtype, key=eff_key)
         if quantizer.is_enabled():
             if module_name not in quantizer_state_dict:
                 logger.debug("- Calibrating %s.weight", module_name)
@@ -81,12 +108,20 @@ def quantize_llm_layer_weights(  # noqa: C901
                 gc.collect()
                 torch.cuda.empty_cache()
     scale_state_dict: dict[str, torch.Tensor | float | None] = {}
-    for module_key, module_name, module, _, _ in layer.named_key_modules():
+    for module_key, module_name, module, parent, field_name in layer.named_key_modules():
+        if only_module_names and module_name not in only_module_names:
+            continue
+        if not _field_allowed(field_name):
+            continue
         assert isinstance(module, nn.Linear)
         qcfg = config.wgts
         if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(module_key):
             qcfg = config.extra_wgts
-        quantizer = LlmWeightQuantizer(qcfg, develop_dtype=config.develop_dtype, key=module_key)
+        eff_key = module_key
+        if field_name in ("q_proj", "k_proj", "v_proj"):
+            assert isinstance(parent, LlmSelfAttentionStruct)
+            eff_key = {"q_proj": parent.q_key, "k_proj": parent.k_key, "v_proj": parent.v_key}[field_name]
+        quantizer = LlmWeightQuantizer(qcfg, develop_dtype=config.develop_dtype, key=eff_key)
         param_name = f"{module_name}.weight"
         if quantizer.is_enabled():
             logger.debug("- Quantizing %s", param_name)

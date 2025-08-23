@@ -9,14 +9,294 @@ import traceback
 
 import torch
 from transformers import GenerationConfig, PreTrainedModel, PreTrainedTokenizer
+import torch.nn.functional as F
 
 from deepcompressor.utils import tools
 
 from .config import LlmCacheConfig, LlmPtqRunConfig, LlmQuantCacheConfig, LlmQuantConfig
 from .nn import LlmModelStruct
 from .quant import quantize_llm_activations, quantize_llm_weights, reorder_llm, rotate_llm, smooth_llm
+from .quant.weight import quantize_llm_layer_weights
+from .quant.quantizer.config import LlmExtraWeightQuantizerConfig
 
 __all__ = ["ptq"]
+
+
+def _evaluate_metric(model, tokenizer, eval_cfg: "LlmEvalConfig", model_name: str, output_dirpath: str, metric: str) -> float:
+    """Run the GPTQ-style evaluator and return either PPL or NLL on the first task.
+
+    - ppl: returns word_perplexity as reported.
+    - nll: returns ln(word_perplexity).
+    """
+    from .eval.config import LlmEvalConfig as _LlmEvalConfig
+
+    assert isinstance(eval_cfg, _LlmEvalConfig)
+    eos_token_ids = GenerationConfig.from_pretrained(tokenizer.name_or_path).eos_token_id
+    if not isinstance(eos_token_ids, list):
+        eos_token_ids = [eos_token_ids]
+    results = eval_cfg.evaluate(
+        model,
+        tokenizer,
+        model_name=model_name,
+        eos_token_ids=eos_token_ids,
+        output_dirpath=output_dirpath,
+    )
+    ev = "gptq" if "gptq" in results else next(iter(results))
+    maxlen_bucket = next(iter(results[ev].keys()))
+    task_name = next(iter(results[ev][maxlen_bucket]["results"].keys()))
+    ppl = float(results[ev][maxlen_bucket]["results"][task_name]["word_perplexity"])
+    if metric.lower() == "nll":
+        import math as _math
+        return float(_math.log(ppl))
+    return ppl
+
+
+def _first_supported_task(tasks: list[str]) -> str:
+    for t in tasks:
+        if t.startswith("wikitext"):
+            return t
+        if t.startswith("pile"):
+            return t
+    return "wikitext-2-raw-v1"
+
+
+def _compute_token_nlls(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    task: str,
+    seq_length: int,
+    max_num_samples: int = -1,
+) -> torch.Tensor:
+    from datasets import load_dataset
+    import torch
+    model.eval()
+    if task.startswith("wikitext"):
+        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        encoded = tokenizer("\n\n".join(ds["text"]), return_tensors="pt").input_ids.to(model.device)
+    elif task.startswith("pile"):
+        ds = load_dataset("pile", task, split="test")
+        encoded = tokenizer("\n\n".join(ds["text"]), return_tensors="pt").input_ids.to(model.device)
+    else:
+        raise ValueError(f"Unsupported task for token NLLs: {task}")
+    num_samples = encoded.numel() // seq_length
+    if max_num_samples > 0:
+        num_samples = min(num_samples, max_num_samples)
+    nlls: list[torch.Tensor] = []
+    with torch.inference_mode():
+        for i in range(num_samples):
+            batch = encoded[:, (i * seq_length) : ((i + 1) * seq_length)]
+            logits = model(batch).logits[:, :-1, :].contiguous().float()
+            labels = batch[:, 1:].contiguous()
+            # per-token negative log-likelihood
+            pt = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.reshape(-1), reduction="none")
+            nlls.append(pt)
+    if len(nlls) == 0:
+        return torch.empty(0, device=model.device)
+    return torch.cat(nlls, dim=0)
+
+
+def _run_single_layer_delta_scan(model, tokenizer, cfg: "LlmPtqRunConfig", logging_level: int) -> None:  # noqa: C901
+    """Compute ΔLoss per submodule field by quantizing only that field at a time.
+
+    Records JSON to output dir: {"baseline": ppl, "fields": {field: {"ppl": v, "delta": v-baseline}}}
+    """
+    logger = tools.logging.getLogger(f"{__name__}.DeltaLoss")
+    logger.info("=== Single-Layer ΔLoss Scan ===")
+    out_dir = cfg.output.get_running_job_path("delta")
+    os.makedirs(out_dir, exist_ok=True)
+    # Decide metric: default to paired NLL when delta mode is enabled unless user explicitly set nll/ppl
+    chosen_metric = cfg.delta_metric.lower()
+    if chosen_metric == "ppl":
+        chosen_metric = "nll"  # default to paired NLL for delta mode
+
+    # 1) Baseline (all high precision)
+    logger.info("* Evaluating baseline (all high)")
+    tools.logging.Formatter.indent_inc()
+    # If paired NLL, compute baseline per-token NLLs once
+    if chosen_metric in ("nll", "nll_paired"):
+        from .eval.config import get_max_seq_length as _get_max_seq_length
+        lm_max = _get_max_seq_length(model, tokenizer)
+        seq_len = lm_max if cfg.eval.max_seq_length in (0, -1) else min(lm_max, abs(cfg.eval.max_seq_length) or 2048)
+        task = _first_supported_task(cfg.eval.tasks)
+        baseline_tokens = _compute_token_nlls(model, tokenizer, task, seq_len)
+        baseline_val = float(baseline_tokens.mean().item()) if baseline_tokens.numel() > 0 else float("nan")
+        metric_name = "nll_paired"
+    else:
+        baseline_val = _evaluate_metric(model, tokenizer, cfg.eval, cfg.model.name + "-baseline", out_dir, chosen_metric)
+        metric_name = chosen_metric
+    tools.logging.Formatter.indent_dec()
+    logger.info(f"  baseline {cfg.delta_metric}: {baseline_val:.6f}")
+
+    # 2) For each layer and each selected linear submodule, quantize only that one and evaluate
+    results = {"metric": metric_name, "baseline": baseline_val, "layers": []}
+    # Helper: filter function for requested submodule roles
+    field_aliases = set(cfg.delta_fields)
+    def _want(field_name: str, module_name: str) -> bool:
+        if not field_aliases:
+            return True
+        if field_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            return field_name in field_aliases
+        if field_name == "down_proj":
+            return ("down" in field_aliases) or ("down_proj" in field_aliases)
+        if field_name == "up_proj":
+            # Distinguish up vs gate by module name suffix when possible
+            is_gate = module_name.endswith((".gate_proj", ".wi_0", ".w1"))
+            is_up = module_name.endswith((".up_proj", ".wi_1", ".w3")) or not is_gate
+            if ("gate" in field_aliases) or ("gate_proj" in field_aliases):
+                return is_gate
+            if ("up" in field_aliases) or ("up_proj" in field_aliases):
+                return is_up
+            return False
+        if field_name == "moe_gate":
+            return ("gate" in field_aliases) or ("moe_gate" in field_aliases)
+        # proj_in / proj_out
+        if field_name == "proj_in":
+            return ("proj_in" in field_aliases)
+        if field_name == "proj_out":
+            return ("proj_out" in field_aliases)
+        return False
+
+    # Iterate layers to collect per-layer module targets
+    from .quant.utils import get_needs_inputs_fn
+    model_struct = LlmModelStruct.construct(model)
+    layer_targets: list[tuple[int, str, str, str]] = []  # (layer_idx, module_key, module_name, field_name)
+    for layer_idx, (_, (layer_struct, layer_cache, layer_kwargs)) in enumerate(
+        cfg.quant.calib.build_loader(tokenizer).iter_layer_activations(
+            model_struct, needs_inputs_fn=get_needs_inputs_fn(model=model_struct, config=cfg.quant)
+        )
+    ):
+        for module_key, module_name, module, parent, field_name in layer_struct.named_key_modules():
+            # consider only Linear modules
+            if getattr(module, "weight", None) is None:
+                continue
+            if not _want(field_name, module_name):
+                continue
+            layer_targets.append((layer_idx, module_key, module_name, field_name))
+
+    # Evaluate each target by quantizing exactly that module
+    for layer_idx, module_key, module_name, field_name in layer_targets:
+        logger.info(f"* Layer {layer_idx}: {module_name}")
+        tools.logging.Formatter.indent_inc()
+        # Rebuild fresh model/tokenizer
+        m, t = cfg.model.build()
+        m_struct = LlmModelStruct.construct(m)
+        # Prepare qcfg: disable base wgts, enable only this module via per-instance filter and (optionally) extra_wgts
+        import copy as _copy
+        qcfg_local = _copy.deepcopy(cfg.quant)
+        qcfg_local.rotation = None
+        qcfg_local.reorder = None
+        qcfg_local.smooth = None
+        # turn off base weights
+        qcfg_local.wgts.dtype = None
+        # limit to this exact module name to ensure only this submodule quantizes
+        qcfg_local.only_module_names = (module_name,)
+        # Prepare extra wgts template (we will set includes after identifying the exact eff_key per layer)
+        base = cfg.quant.wgts
+        qcfg_local.extra_wgts = LlmExtraWeightQuantizerConfig(
+            includes=[],
+            dtype=base.dtype,
+            zero_point=base.zero_point,
+            group_shapes=base.group_shapes,
+            scale_dtypes=base.scale_dtypes,
+            intermediate_dtypes=getattr(base, "intermediate_dtypes", ()),
+            intermediate_levels=getattr(base, "intermediate_levels", ()),
+            needs_dequant_saturation=getattr(base, "needs_dequant_saturation", False),
+            skips=[],
+            kernel_gptq=base.kernel_gptq,
+            calib_range=base.calib_range,
+        )
+        # Calibrate and quantize only the target layer (to keep runtime reasonable)
+        quant_done = False
+        # Cache inputs for all supported modules (avoid unsupported activations like SiLU)
+        import torch.nn as _nn
+        def _needs_inputs(name: str, module: _nn.Module) -> bool:
+            cls = module.__class__.__name__
+            if isinstance(module, _nn.Linear):
+                return True
+            if cls in ("RotaryEmbedding", "MixtralSparseMoeBlock", "T5DenseActDense", "T5DenseGatedActDense"):
+                return True
+            if cls.endswith(("DecoderLayer", "Attention", "MLP")):
+                return True
+            return False
+
+        for idx, (_, (lyr, lyr_cache, lyr_kwargs)) in enumerate(
+            qcfg_local.calib.build_loader(t).iter_layer_activations(
+                m_struct,
+                needs_inputs_fn=_needs_inputs,
+            )
+        ):
+            if idx != layer_idx:
+                continue
+            # Identify the effective include key for this module instance within this layer
+            eff_key = module_key
+            if field_name.endswith("_proj") or field_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                # Try to match against attention names
+                for attn in getattr(lyr, "attn_structs", []):
+                    if field_name == "q_proj" and attn.q_proj_name == module_name:
+                        eff_key = attn.q_key
+                        break
+                    if field_name == "k_proj" and attn.k_proj_name == module_name:
+                        eff_key = attn.k_key
+                        break
+                    if field_name == "v_proj" and attn.v_proj_name == module_name:
+                        eff_key = attn.v_key
+                        break
+                    if field_name == "o_proj" and attn.o_proj_name == module_name:
+                        eff_key = attn.out_proj_key
+                        break
+                # Match FFN projections
+                ffn = getattr(lyr, "ffn_struct", None)
+                if ffn is not None and eff_key == module_key:
+                    if field_name == "up_proj" and module_name in ffn.up_proj_names:
+                        eff_key = ffn.up_proj_key
+                    elif field_name == "down_proj" and module_name in ffn.down_proj_names:
+                        eff_key = ffn.down_proj_key
+            # Set includes to the identified eff_key
+            qcfg_local.extra_wgts.includes = [eff_key]
+            quantize_llm_layer_weights(
+                layer=lyr,
+                config=qcfg_local,
+                quantizer_state_dict={},
+                layer_cache=lyr_cache,
+                layer_kwargs=lyr_kwargs,
+                return_with_scale_state_dict=False,
+            )
+            quant_done = True
+            break
+        if not quant_done:
+            logger.warning("  could not quantize layer %d for %s", layer_idx, module_name)
+            tools.logging.Formatter.indent_dec()
+            continue
+        if chosen_metric in ("nll", "nll_paired"):
+            # Paired per-token NLL difference
+            from .eval.config import get_max_seq_length as _get_max_seq_length
+            lm_max = _get_max_seq_length(m, t)
+            seq_len = lm_max if cfg.eval.max_seq_length in (0, -1) else min(lm_max, abs(cfg.eval.max_seq_length) or 2048)
+            task = _first_supported_task(cfg.eval.tasks)
+            model_tokens = _compute_token_nlls(m, t, task, seq_len)
+            # align lengths just in case
+            L = min(baseline_tokens.numel(), model_tokens.numel())
+            paired_delta = (model_tokens[:L] - baseline_tokens[:L]).mean().item() if L > 0 else float("nan")
+            val = float(model_tokens[:L].mean().item()) if L > 0 else float("nan")
+            delta = float(paired_delta)
+        else:
+            val = _evaluate_metric(m, t, cfg.eval, cfg.model.name + f"-L{layer_idx}-{module_name}", out_dir, chosen_metric)
+            delta = val - baseline_val
+        # Accumulate per-layer results
+        while len(results["layers"]) <= layer_idx:
+            results["layers"].append({"modules": []})
+        results["layers"][layer_idx]["modules"].append({
+            "module": module_name,
+            "key": module_key,
+            metric_name: val,
+            "delta": delta,
+        })
+        logger.info(f"  {metric_name}: {val:.6f} | Δ: {delta:.6f}")
+        tools.logging.Formatter.indent_dec()
+
+    with open(os.path.join(out_dir, "delta_loss.json"), "w") as f:
+        json.dump(results, f, indent=2)
+    logger.info(f"Saved ΔLoss results to {out_dir}")
 
 
 def ptq(  # noqa: C901
@@ -341,6 +621,11 @@ def main(config: LlmPtqRunConfig, logging_level: int = tools.logging.DEBUG) -> N
     tools.logging.Formatter.indent_inc()
     model, tokenizer = config.model.build()
     tools.logging.Formatter.indent_dec()
+    # Delta-loss mode: compute baseline and per-field deltas, then exit
+    if getattr(config, "delta_single_layer", False):
+        _run_single_layer_delta_scan(model, tokenizer, config, logging_level)
+        config.output.unlock()
+        return
     save_dirpath = os.path.join(config.output.running_job_dirpath, "cache")
     if config.save_model:
         if config.save_model.lower() in ("false", "none", "null", "nil"):

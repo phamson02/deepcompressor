@@ -55,6 +55,12 @@ class LlmQuantConfig(LlmModuleQuantizerConfig):
     reorder: SkipBasedChannelOrderConfig | None = None
     smooth: SmoothTransfomerConfig | None = None
     develop_dtype: torch.dtype = field(default_factory=lambda s=torch.float32: eval_dtype(s, with_quant_dtype=False))
+    # If set, restricts quantization to only these linear submodule field names
+    # e.g., {"q_proj","k_proj","v_proj","o_proj","up_proj","down_proj","moe_gate","proj_in","proj_out"}
+    only_fields: tuple[str, ...] = ()
+    # If set, restricts quantization to only these exact module names (full dotted path)
+    # e.g., "model.layers.0.self_attn.q_proj"
+    only_module_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:  # noqa: C901
         # Ensure base module-quantizer post-init runs (handles extra_wgts harmonization)
