@@ -115,7 +115,7 @@ def quantize_llm_layer_weights(  # noqa: C901
             continue
         assert isinstance(module, nn.Linear)
         qcfg = config.wgts
-        if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(module_key):
+        if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(eff_key):
             qcfg = config.extra_wgts
         eff_key = module_key
         if field_name in ("q_proj", "k_proj", "v_proj"):

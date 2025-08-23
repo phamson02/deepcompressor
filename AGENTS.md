@@ -9,16 +9,18 @@
 - `assets/`: figures and images for docs.
 
 ## Build, Test, and Development Commands
-- Create env and install deps:
-  - `conda env create -f environment.yml`
-  - `poetry install`
+- Create env and install deps (uv):
+  - Install uv (one-time): see https://docs.astral.sh/uv/getting-started/
+  - Create venv and install deps: `uv venv && uv sync`
+    - Uses `.python-version` (3.12) automatically; alternatively: `uv venv -p 3.12`.
+    - To include dev tools: `uv sync --all-groups`.
 - Lint and format (Ruff):
-  - `poetry run ruff check .`
-  - `poetry run ruff format .`
+  - `uvx ruff check .`
+  - `uvx ruff format .`
 - Run LLM PTQ locally (example):
-  - `CUDA_VISIBLE_DEVICES=0 poetry run python -m deepcompressor.app.llm.ptq examples/llm/configs/awq.yaml --model-name llama-3-8b --model-path /dev/shm/Meta-Llama-3-8B --save-model true`
+  - `CUDA_VISIBLE_DEVICES=0 uv run -m deepcompressor.app.llm.ptq examples/llm/configs/awq.yaml --model-name llama-3-8b --model-path /dev/shm/Meta-Llama-3-8B --save-model true`
   - Outputs: logs under the configured run dir; quantized checkpoints and a copy under `/dev/shm/sonpt/calibrated_models/<model_name>`.
-- Build package: `poetry build`
+- Build package: `uv build`
 
 ## Coding Style & Naming Conventions
 - Python ≥ 3.10; type hints encouraged.
@@ -28,7 +30,7 @@
 
 ## Testing Guidelines
 - This repo uses runnable examples as smoke tests. Validate changes by running configs in `examples/llm` or `examples/diffusion` and checking saved artifacts and metrics.
-- If you add unit tests, prefer `pytest`, place under `tests/`, and name files `test_*.py`. Ensure `poetry run ruff check .` passes before opening a PR.
+- If you add unit tests, prefer `pytest`, place under `tests/`, and name files `test_*.py`. Ensure `uvx ruff check .` passes before opening a PR.
 
 ## Commit & Pull Request Guidelines
 - Commits: concise, imperative tense; optionally prefix scope or impact (e.g., `[minor]`, `[major]`). Reference files or modules touched.

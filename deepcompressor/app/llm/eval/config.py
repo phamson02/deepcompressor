@@ -46,7 +46,7 @@ class LlmEvalConfig:
     """
 
     num_gpus: int = field(default=1, metadata={omniconfig.ARGPARSE_ARGS: ("--num-gpus", "-n")})
-    batch_size: int = 1
+    batch_size: int = field(default=1, metadata={omniconfig.ARGPARSE_ARGS: ("--batch-size", "-b")})
     tasks: list[str] = field(
         default_factory=lambda: ["zero-shot"],
         metadata={omniconfig.ARGPARSE_KWARGS: {"nargs": "+", "type": str}},

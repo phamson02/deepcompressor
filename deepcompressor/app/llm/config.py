@@ -80,8 +80,23 @@ class LlmPtqRunConfig:
         ],
         metadata={omniconfig.ARGPARSE_KWARGS: {"nargs": "*", "type": str}},
     )
-    # Metric to compare in delta mode: "ppl" or "nll"
-    delta_metric: str = field(default="ppl")
+    # Metric to compare in delta mode: "ppl", "nll" (paired NLL), or "auto" (defaults to paired NLL)
+    delta_metric: str = field(default="auto")
+    # Activation caching for ΔLoss scan: auto (use if present, build if missing), force (always build/use), skip (never cache)
+    delta_act_cache: str = field(
+        default="auto",
+        metadata={omniconfig.ARGPARSE_ARGS: ("--delta-act-cache",), "help": "Activation cache mode: auto|force|skip"},
+    )
+    # Activation cache directory: default empty uses <run_dir>/delta/act_cache; use 'shm' to route to /dev/shm
+    delta_act_cache_dir: str = field(
+        default="",
+        metadata={omniconfig.ARGPARSE_ARGS: ("--delta-act-cache-dir",), "help": "Dir for per-layer activation cache or 'shm'"},
+    )
+    # Delete activation cache directory at the end of ΔLoss scan
+    delta_act_cache_cleanup: bool = field(
+        default=True,
+        metadata={omniconfig.ARGPARSE_ARGS: ("--delta-act-cache-cleanup",), "help": "Delete act_cache after scan"},
+    )
 
     def __post_init__(self):  # noqa: C901
         # region set scale default dtype
