@@ -359,17 +359,10 @@ def _run_single_layer_delta_scan(model, tokenizer, cfg: "LlmPtqRunConfig", loggi
         model.to("cpu")
     except Exception:
         pass
-    del model_struct
-    del model, tokenizer
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    # Free the baseline model/tokenizer to release GPU memory before scanning layers
     try:
-        model.to("cpu")
+        del model_struct
     except Exception:
         pass
-    del model_struct
     del model, tokenizer
     gc.collect()
     torch.cuda.empty_cache()
