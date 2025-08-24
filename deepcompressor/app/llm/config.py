@@ -75,6 +75,7 @@ class LlmPtqRunConfig:
             "v_proj",
             "o_proj",
             "up_proj",
+            "gate",
             "down_proj",
             "moe_gate",
         ],
