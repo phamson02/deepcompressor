@@ -23,6 +23,7 @@ from .quant.weight import quantize_llm_layer_weights
 from deepcompressor.data.cache import IOTensorsCache, TensorCache
 from deepcompressor.data.utils.reshape import LinearReshapeFn
 from .quant.quantizer.config import LlmExtraWeightQuantizerConfig
+import math
 
 __all__ = ["ptq"]
 
@@ -831,6 +832,234 @@ def ptq(  # noqa: C901
     return model.module
 
 
+@torch.inference_mode()
+def _compute_activation_metrics(
+    orig_model: PreTrainedModel,
+    quant_model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    cfg: "LlmPtqRunConfig",
+) -> dict:
+    """Compute KLD, MSE, MAE, and Cosine similarity between original and quantized activations.
+
+    Uses cfg.quant.calib loader to iterate layers and capture outputs for modules with supported caches.
+    """
+    logger = tools.logging.getLogger(f"{__name__}.ActMetrics")
+    logger.info("=== Activation Metrics (orig vs quant) ===")
+    o_struct = LlmModelStruct.construct(orig_model)
+    q_struct = LlmModelStruct.construct(quant_model)
+
+    import torch.nn as _nn
+    def _needs_outputs(name: str, module: _nn.Module) -> bool:
+        cls = module.__class__.__name__
+        if isinstance(module, _nn.Linear):
+            return True
+        if cls in ("RotaryEmbedding", "MixtralSparseMoeBlock", "T5DenseActDense", "T5DenseGatedActDense"):
+            return True
+        if cls.endswith(("DecoderLayer", "Attention", "MLP")):
+            return True
+        return False
+
+    loader_o = cfg.quant.calib.build_loader(tokenizer)
+    loader_q = cfg.quant.calib.build_loader(tokenizer)
+    if (getattr(cfg, "act_metrics_source", "calib") or "calib").lower().strip() == "eval":
+        from .eval.config import get_max_seq_length as _get_max_seq_length
+        from datasets import load_dataset as _load_dataset
+        lm_max = _get_max_seq_length(orig_model, tokenizer)
+        if cfg.eval.max_seq_length < 0:
+            max_seq_length = lm_max if cfg.eval.max_seq_length == -1 else min(lm_max, -cfg.eval.max_seq_length)
+        elif cfg.eval.max_seq_length == 0:
+            max_seq_length = lm_max
+        else:
+            max_seq_length = cfg.eval.max_seq_length
+        seq_len = max_seq_length
+        task = _first_supported_task(cfg.eval.tasks)
+        if task.startswith("wikitext"):
+            _ds = _load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+            _text = "\n\n".join(_ds["text"])
+        elif task.startswith("pile"):
+            _ds = _load_dataset("pile", task, split="test")
+            _text = "\n\n".join(_ds["text"])
+        else:
+            raise ValueError(f"Unsupported task for act-metrics eval source: {task}")
+        _encoded = tokenizer(_text, return_tensors="pt").input_ids
+        total_tokens = int(_encoded.numel())
+        num_samples = total_tokens // seq_len
+        try:
+            env_max = int(os.environ.get("DEEPCOMPRESSOR_TOKEN_NLL_MAX_SAMPLES", "0"))
+            if env_max > 0:
+                num_samples = min(num_samples, env_max)
+        except Exception:
+            pass
+        if num_samples > 0:
+            _encoded = _encoded[:, : num_samples * seq_len]
+            _windows = _encoded.view(num_samples, seq_len).contiguous()
+            class _WindowsDataset(torch.utils.data.Dataset):
+                def __init__(self, data: torch.Tensor):
+                    self.data = data
+                def __len__(self):
+                    return self.data.shape[0]
+                def __getitem__(self, idx: int) -> torch.Tensor:
+                    return self.data[idx]
+            _ds_windows = _WindowsDataset(_windows)
+            loader_o.dataset = _ds_windows
+            loader_q.dataset = _ds_windows
+            loader_o.batch_size = 1
+            loader_q.batch_size = 1
+
+    try:
+        max_rows = int(os.environ.get("DEEPCOMPRESSOR_ACT_METRICS_MAX_ROWS", "8192"))
+    except Exception:
+        max_rows = 8192
+    kld_mode = (getattr(cfg, "act_metrics_kld_mode", "softmax") or "softmax").lower().strip()
+    hist_bins = max(10, int(getattr(cfg, "act_metrics_bins", 100)))
+
+    def _concat_rows_from(tc: IOTensorsCache) -> torch.Tensor:
+        rows = tc.outputs.front().get_standardized_data(reshape=False)
+        if not rows:
+            return torch.empty(0, 0)
+        x = torch.cat(rows, dim=0).to(dtype=torch.float32, device="cpu")
+        if max_rows > 0 and x.shape[0] > max_rows:
+            idx = torch.linspace(0, x.shape[0] - 1, steps=max_rows).round().long()
+            x = x.index_select(0, idx)
+        return x
+
+    def _metrics(x: torch.Tensor, y: torch.Tensor) -> dict[str, float]:
+        n_min = min(x.shape[0], y.shape[0])
+        if n_min == 0 or x.shape[-1] != y.shape[-1]:
+            return {"mse": float("nan"), "mae": float("nan"), "cos": float("nan"), "kld": float("nan"), "rows": 0, "dim": 0}
+        x = x[:n_min]
+        y = y[:n_min]
+        diff = x - y
+        mse = diff.pow(2).mean().item()
+        mae = diff.abs().mean().item()
+        eps = 1e-12
+        x_norm = x.norm(dim=-1) + eps
+        y_norm = y.norm(dim=-1) + eps
+        cos = (x.mul(y).sum(dim=-1) / (x_norm * y_norm)).mean().item()
+        if kld_mode == "softmax":
+            p_log = torch.log_softmax(x, dim=-1)
+            q_log = torch.log_softmax(y, dim=-1)
+            p = p_log.exp()
+            kld = (p * (p_log - q_log)).sum(dim=-1).mean().item()
+        else:
+            # Histogram divergence with shared bins: JS (default) or KL(P||Q) if hist_kl
+            xf = x.flatten()
+            yf = y.flatten()
+            lo = torch.minimum(xf.min(), yf.min()).float()
+            hi = torch.maximum(xf.max(), yf.max()).float()
+            if not torch.isfinite(lo):
+                lo = torch.tensor(0.0)
+            if not torch.isfinite(hi):
+                hi = torch.tensor(1.0)
+            if hi <= lo:
+                hi = lo + 1e-6
+            edges = torch.linspace(lo, hi, steps=hist_bins + 1, device="cpu", dtype=torch.float32)
+            cx = torch.histogram(xf.float().cpu(), bins=edges)[0]
+            cy = torch.histogram(yf.float().cpu(), bins=edges)[0]
+            epsh = 1e-8
+            px = (cx + epsh) / (cx.sum() + epsh * cx.numel())
+            py = (cy + epsh) / (cy.sum() + epsh * cy.numel())
+            if kld_mode == "hist_kl":
+                kld = (px * (px.log() - py.log())).sum().item()
+            else:
+                m = 0.5 * (px + py)
+                kld = 0.5 * ((px * (px.log() - m.log())).sum() + (py * (py.log() - m.log())).sum()).item()
+        return {"mse": mse, "mae": mae, "cos": cos, "kld": kld, "rows": int(n_min), "dim": int(x.shape[-1])}
+
+    # Restrict to target roles and avoid aliasing by using the base iterator
+    from deepcompressor.dataset.action import ConcatCacheAction
+    desired_roles = {"q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "moe_gate"}
+    role_names_by_layer: list[dict[str, str]] = []
+    allowed_names: set[str] = set()
+    for layer_struct in o_struct.backbone_struct.layer_structs:
+        name_to_role: dict[str, str] = {}
+        for _, module_name, _, parent, field_name in layer_struct.named_key_modules():
+            if field_name in desired_roles:
+                if field_name == "moe_gate":
+                    role = "gate"
+                elif field_name == "up_proj":
+                    role = "gate" if module_name.endswith((".gate_proj", ".wi_0", ".w1")) else "up"
+                else:
+                    role = field_name.replace("_proj", "")
+                name_to_role[module_name] = role
+                allowed_names.add(module_name)
+        role_names_by_layer.append(name_to_role)
+
+    def _needs_outputs_filtered(name: str, module: _nn.Module) -> bool:
+        return isinstance(module, _nn.Linear) and (name in allowed_names)
+
+    results: dict[str, dict[str, dict[str, float]]] = {}
+    o_layers, o_layer_structs, o_recomputes, o_use_prev = o_struct.get_iter_layer_activations_args()
+    q_layers, q_layer_structs, q_recomputes, q_use_prev = q_struct.get_iter_layer_activations_args()
+    with tools.logging.redirect_tqdm():
+        gen_o = loader_o._iter_layer_activations(
+            o_struct.module,
+            action=ConcatCacheAction("cpu"),
+            layers=o_layers,
+            needs_inputs_fn=False,
+            needs_outputs_fn=_needs_outputs_filtered,
+            recomputes=o_recomputes,
+            use_prev_layer_outputs=o_use_prev,
+        )
+        gen_q = loader_q._iter_layer_activations(
+            q_struct.module,
+            action=ConcatCacheAction("cpu"),
+            layers=q_layers,
+            needs_inputs_fn=False,
+            needs_outputs_fn=_needs_outputs_filtered,
+            recomputes=q_recomputes,
+            use_prev_layer_outputs=q_use_prev,
+        )
+        for layer_idx, ((lname_o, (_, cache_o, _)), (lname_q, (_, cache_q, _))) in enumerate(
+            tqdm(zip(gen_o, gen_q), total=min(len(o_layer_structs), len(q_layer_structs)), desc="act metrics", dynamic_ncols=True)
+        ):
+            assert lname_o == lname_q
+            role_map = role_names_by_layer[layer_idx]
+            names = (set(cache_o.keys()) & set(cache_q.keys())) & set(role_map.keys())
+            res_layer: dict[str, dict[str, float]] = {}
+            aggregate_mode = (getattr(cfg, "act_metrics_aggregate", "role") or "role").lower().strip()
+            if aggregate_mode == "module":
+                for name in sorted(names):
+                    io_o = cache_o[name]
+                    io_q = cache_q[name]
+                    if getattr(io_o, "outputs", None) is None or getattr(io_q, "outputs", None) is None:
+                        continue
+                    x = _concat_rows_from(io_o)
+                    y = _concat_rows_from(io_q)
+                    m = _metrics(x, y)
+                    short = name.split(".")[-1]
+                    key = short if short not in res_layer else name
+                    res_layer[key] = m
+            else:
+                agg: dict[str, dict[str, float]] = {}
+                counts: dict[str, int] = {}
+                for name in names:
+                    io_o = cache_o[name]
+                    io_q = cache_q[name]
+                    if getattr(io_o, "outputs", None) is None or getattr(io_q, "outputs", None) is None:
+                        continue
+                    x = _concat_rows_from(io_o)
+                    y = _concat_rows_from(io_q)
+                    role = role_map[name]
+                    m = _metrics(x, y)
+                    if role not in agg:
+                        agg[role] = {k: 0.0 for k in ("mse", "mae", "cos", "kld")}
+                        counts[role] = 0
+                    for k in ("mse", "mae", "cos", "kld"):
+                        if not math.isnan(m[k]):
+                            agg[role][k] += m[k]
+                    counts[role] += 1
+                for role, sums in agg.items():
+                    c = max(1, counts.get(role, 1))
+                    res_layer[role] = {k: (sums[k] / c) for k in sums}
+                    res_layer[role]["count"] = c
+            results[lname_o] = res_layer
+            del cache_o, cache_q
+            gc.collect()
+            torch.cuda.empty_cache()
+    return results
+
+
 def main(config: LlmPtqRunConfig, logging_level: int = tools.logging.DEBUG) -> None:  # noqa: C901
     """Post-training quantization and evaluation of a large language model.
 
@@ -902,6 +1131,25 @@ def main(config: LlmPtqRunConfig, logging_level: int = tools.logging.DEBUG) -> N
         with open(os.path.join(config.output.get_running_job_path("results.json")), "w") as f:
             json.dump(results, f, indent=2)
         # endregion
+    # region activation metrics (optional)
+    if getattr(config, "act_metrics", False):
+        logger.info("* Computing activation metrics (orig vs quant)")
+        tools.logging.Formatter.indent_inc()
+        orig_model, _ = config.model.build()
+        orig_model.eval()
+        model.eval()
+        act_results = _compute_activation_metrics(
+            orig_model,
+            model,
+            tokenizer,
+            config,
+        )
+        tools.logging.Formatter.indent_dec()
+        act_path = os.path.join(config.output.get_running_job_path("eval"), "act_metrics.json")
+        os.makedirs(os.path.dirname(act_path), exist_ok=True)
+        with open(act_path, "w") as f:
+            json.dump(act_results, f, indent=2)
+        logger.info(f"* Saved activation metrics to {act_path}")
     config.output.unlock()
 
 

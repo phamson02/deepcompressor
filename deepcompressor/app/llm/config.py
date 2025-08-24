@@ -83,6 +83,28 @@ class LlmPtqRunConfig:
     )
     # Metric to compare in delta mode: "ppl", "nll" (paired NLL), or "auto" (defaults to paired NLL)
     delta_metric: str = field(default="auto")
+    # Compute activation metrics between original and quantized models
+    act_metrics: bool = field(default=False, metadata={omniconfig.ARGPARSE_ARGS: ("--act-metrics",)})
+    # Activation metrics KLD mode: softmax (per-row channel softmax), hist (JS over histograms), or hist_kl (KL(P||Q) over histograms)
+    act_metrics_kld_mode: str = field(
+        default="softmax",
+        metadata={omniconfig.ARGPARSE_ARGS: ("--act-metrics-kld-mode",), "help": "softmax|hist|hist_kl"},
+    )
+    # Activation metrics histogram bins when kld-mode=hist (JS by default)
+    act_metrics_bins: int = field(
+        default=100,
+        metadata={omniconfig.ARGPARSE_ARGS: ("--act-metrics-bins",), "help": "Histogram bins for hist mode"},
+    )
+    # Activation metrics aggregation: role (aggregate across modules) or module (report each module)
+    act_metrics_aggregate: str = field(
+        default="role",
+        metadata={omniconfig.ARGPARSE_ARGS: ("--act-metrics-aggregate",), "help": "role|module"},
+    )
+    # Activation metrics source: calib (calibration loader) or eval (same dataset/windows as delta NLL)
+    act_metrics_source: str = field(
+        default="calib",
+        metadata={omniconfig.ARGPARSE_ARGS: ("--act-metrics-source",), "help": "calib|eval"},
+    )
     # Activation caching for ΔLoss scan: auto (use if present, build if missing), force (always build/use), skip (never cache)
     delta_act_cache: str = field(
         default="auto",
