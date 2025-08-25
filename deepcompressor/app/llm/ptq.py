@@ -1072,13 +1072,13 @@ def _compute_activation_metrics(
                     y = _concat_rows_from(io_q)
                     role = role_map[name]
                     m = _metrics(x, y)
-                if role not in agg:
-                    agg[role] = {k: 0.0 for k in ("nmse", "nmae", "cos", "kld")}
-                    counts[role] = 0
-                for k in ("nmse", "nmae", "cos", "kld"):
-                    if not math.isnan(m[k]):
-                        agg[role][k] += m[k]
-                counts[role] += 1
+                    if role not in agg:
+                        agg[role] = {k: 0.0 for k in ("nmse", "nmae", "cos", "kld")}
+                        counts[role] = 0
+                    for k in ("nmse", "nmae", "cos", "kld"):
+                        if not math.isnan(m[k]):
+                            agg[role][k] += m[k]
+                    counts[role] += 1
                 for role, sums in agg.items():
                     c = max(1, counts.get(role, 1))
                     res_layer[role] = {k: (sums[k] / c) for k in sums}
