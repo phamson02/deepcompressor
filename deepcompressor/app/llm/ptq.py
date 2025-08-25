@@ -893,6 +893,13 @@ def _compute_activation_metrics(
         if num_samples > 0:
             _encoded = _encoded[:, : num_samples * seq_len]
             _windows = _encoded.view(num_samples, seq_len).contiguous()
+            # Build row-wise mask to exclude padding tokens from aggregation
+            try:
+                pad_id = getattr(tokenizer, "pad_token_id", None)
+                if pad_id is not None:
+                    row_mask = (_windows != pad_id).view(-1).to(device="cpu").bool()
+            except Exception:
+                row_mask = None
             class _WindowsDataset(torch.utils.data.Dataset):
                 def __init__(self, data: torch.Tensor):
                     self.data = data
@@ -913,11 +920,20 @@ def _compute_activation_metrics(
     kld_mode = (getattr(cfg, "act_metrics_kld_mode", "softmax") or "softmax").lower().strip()
     hist_bins = max(10, int(getattr(cfg, "act_metrics_bins", 100)))
 
+    # Optional row-wise mask (for eval source) to exclude padding tokens
+    row_mask = None
+
     def _concat_rows_from(tc: IOTensorsCache) -> torch.Tensor:
         rows = tc.outputs.front().get_standardized_data(reshape=False)
         if not rows:
             return torch.empty(0, 0)
         x = torch.cat(rows, dim=0).to(dtype=torch.float32, device="cpu")
+        # Apply non-padding mask if available
+        if row_mask is not None and row_mask.numel() >= x.shape[0]:
+            try:
+                x = x[row_mask[: x.shape[0]]]
+            except Exception:
+                pass
         if max_rows > 0 and x.shape[0] > max_rows:
             idx = torch.linspace(0, x.shape[0] - 1, steps=max_rows).round().long()
             x = x.index_select(0, idx)
@@ -930,8 +946,10 @@ def _compute_activation_metrics(
         x = x[:n_min]
         y = y[:n_min]
         diff = x - y
-        mse = diff.pow(2).mean().item()
-        mae = diff.abs().mean().item()
+        # Normalized errors per token (row), then mean over tokens
+        epsn = 1e-12
+        nmse = (diff.pow(2).sum(dim=-1) / (x.pow(2).sum(dim=-1) + epsn)).mean().item()
+        nmae = (diff.abs().sum(dim=-1) / (x.abs().sum(dim=-1) + epsn)).mean().item()
         eps = 1e-12
         x_norm = x.norm(dim=-1) + eps
         y_norm = y.norm(dim=-1) + eps
@@ -942,29 +960,41 @@ def _compute_activation_metrics(
             p = p_log.exp()
             kld = (p * (p_log - q_log)).sum(dim=-1).mean().item()
         else:
-            # Histogram divergence with shared bins: JS (default) or KL(P||Q) if hist_kl
-            xf = x.flatten()
-            yf = y.flatten()
-            lo = torch.minimum(xf.min(), yf.min()).float()
-            hi = torch.maximum(xf.max(), yf.max()).float()
-            if not torch.isfinite(lo):
-                lo = torch.tensor(0.0)
-            if not torch.isfinite(hi):
-                hi = torch.tensor(1.0)
-            if hi <= lo:
-                hi = lo + 1e-6
-            edges = torch.linspace(lo, hi, steps=hist_bins + 1, device="cpu", dtype=torch.float32)
-            cx = torch.histogram(xf.float().cpu(), bins=edges)[0]
-            cy = torch.histogram(yf.float().cpu(), bins=edges)[0]
-            epsh = 1e-8
-            px = (cx + epsh) / (cx.sum() + epsh * cx.numel())
-            py = (cy + epsh) / (cy.sum() + epsh * cy.numel())
-            if kld_mode == "hist_kl":
-                kld = (px * (px.log() - py.log())).sum().item()
+            # Histogram divergence per feature across tokens, then mean over features
+            C = x.shape[-1]
+            if C == 0:
+                kld = float("nan")
             else:
-                m = 0.5 * (px + py)
-                kld = 0.5 * ((px * (px.log() - m.log())).sum() + (py * (py.log() - m.log())).sum()).item()
-        return {"mse": mse, "mae": mae, "cos": cos, "kld": kld, "rows": int(n_min), "dim": int(x.shape[-1])}
+                ksum = 0.0
+                cnt = 0
+                epsh = 1e-8
+                xcpu = x.float().cpu()
+                ycpu = y.float().cpu()
+                for c in range(C):
+                    xc = xcpu[:, c]
+                    yc = ycpu[:, c]
+                    lo = torch.minimum(xc.min(), yc.min()).float()
+                    hi = torch.maximum(xc.max(), yc.max()).float()
+                    if not torch.isfinite(lo):
+                        lo = torch.tensor(0.0)
+                    if not torch.isfinite(hi):
+                        hi = torch.tensor(1.0)
+                    if hi <= lo:
+                        hi = lo + 1e-6
+                    edges = torch.linspace(lo, hi, steps=hist_bins + 1)
+                    cx = torch.histogram(xc, bins=edges)[0]
+                    cy = torch.histogram(yc, bins=edges)[0]
+                    px = (cx + epsh) / (cx.sum() + epsh * cx.numel())
+                    py = (cy + epsh) / (cy.sum() + epsh * cy.numel())
+                    if kld_mode == "hist_kl":
+                        val = (px * (px.log() - py.log())).sum()
+                    else:
+                        m = 0.5 * (px + py)
+                        val = 0.5 * ((px * (px.log() - m.log())).sum() + (py * (py.log() - m.log())).sum())
+                    ksum += float(val)
+                    cnt += 1
+                kld = ksum / max(1, cnt)
+        return {"nmse": nmse, "nmae": nmae, "cos": cos, "kld": kld, "rows": int(n_min), "dim": int(x.shape[-1])}
 
     # Restrict to target roles and avoid aliasing by using the base iterator
     from deepcompressor.dataset.action import ConcatCacheAction
